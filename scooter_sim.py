@@ -19,7 +19,7 @@ WINDOW_HEIGHT = 800
 FPS = 60
 
 # Colors
-COLOR_BACKGROUND = (128, 128, 128)  # Gray
+COLOR_BACKGROUND = (50, 150, 50)  # Green
 COLOR_SCOOTER_BLUE = (50, 100, 255)
 COLOR_SCOOTER_ORANGE = (255, 165, 0)
 COLOR_SCOOTER_RED = (255, 50, 50)
@@ -33,11 +33,18 @@ COLOR_DEAD = (50, 50, 50)
 SCOOTER_RADIUS = 12
 USER_RADIUS = 10
 CHARGE_STATION_SIZE = 40
-OBSTACLE_MIN_SIZE = 20
-OBSTACLE_MAX_SIZE = 50
-NUM_SCOOTERS = 5
-NUM_OBSTACLES = 8
+OBSTACLE_MIN_SIZE = 40
+OBSTACLE_MAX_SIZE = 120
+NUM_SCOOTERS = 10
+NUM_OBSTACLES = 18
 NUM_CHARGE_STATIONS = 3
+NUM_SPIN_SCOOTERS = 10
+
+# Pedestrian constants
+TARGET_PEDESTRIANS_OUR = 3  # Pedestrians using our scooters
+TARGET_PEDESTRIANS_SPIN = 3  # Pedestrians using SPIN
+TARGET_TOTAL_PEDESTRIANS = TARGET_PEDESTRIANS_OUR + TARGET_PEDESTRIANS_SPIN
+PEDESTRIAN_SPAWN_INTERVAL = 60  # Spawn every 60 frames (1 second at 60 FPS)
 
 # Scooter constants
 MAX_SPEED = 4.0
@@ -54,6 +61,11 @@ MAX_RIDE_TIME = 1200  # frames (20 seconds at 60 FPS)
 # Collision avoidance constants
 COLLISION_AVOIDANCE_DISTANCE = 30  # For scooters
 SEPARATION_FORCE_MULTIPLIER = 2.0
+
+# SPIN competitor constants
+SPIN_COLOR = (255, 100, 0)  # Orange
+PEDESTRIAN_SPEED = 0.375  # px/frame (1.5 / 4 = 0.375, much slower than scooters)
+PEDESTRIAN_RADIUS = 6
 
 # Landmark constants
 LANDMARK_SIZE = 35
@@ -520,6 +532,125 @@ class Scooter:
         return labels.get(self.state, "?")
 
 
+class SpinScooter:
+    """SPIN competitor scooter - stationary, users must walk to it"""
+    def __init__(self, x, y):
+        self.pos = Point(x, y)
+        self.available = True
+        self.battery = 100.0
+        self.user = None
+        self.destination = None
+        self.ride_timer = 0
+        self.velocity = 0.0
+        self.angle = 0.0
+    
+    def assign_user(self, user):
+        """Assign a user to this SPIN scooter"""
+        self.user = user
+        self.available = False
+        user.assigned_scooter = self
+        user.state = "walking_to_spin"
+    
+    def update(self, obstacles):
+        """Update SPIN scooter state"""
+        if self.user is None:
+            return
+        
+        # If user is walking to scooter, wait
+        if self.user.state == "walking_to_spin":
+            return
+        
+        # If user is riding, move to destination
+        if self.user.state == "riding_spin":
+            if self.destination is None:
+                # Set destination
+                self.destination = self.user.get_destination_point()
+                self.ride_timer = random.randint(MIN_RIDE_TIME, MAX_RIDE_TIME)
+            
+            # Move toward destination
+            if self.destination:
+                dx = self.destination.x - self.pos.x
+                dy = self.destination.y - self.pos.y
+                distance = math.sqrt(dx * dx + dy * dy)
+                
+                if distance < PICKUP_DISTANCE:
+                    # Reached destination
+                    self.user.state = "completed"
+                    self.user = None
+                    self.destination = None
+                    self.available = True
+                    self.velocity = 0.0
+                    return
+                
+                # Move toward destination
+                self.angle = math.atan2(dy, dx)
+                self.velocity = min(MAX_SPEED * 0.8, distance * 0.1)  # Slightly slower than our scooters
+                
+                # Update position
+                new_x = self.pos.x + math.cos(self.angle) * self.velocity
+                new_y = self.pos.y + math.sin(self.angle) * self.velocity
+                new_x = max(SCOOTER_RADIUS, min(WINDOW_WIDTH - SCOOTER_RADIUS, new_x))
+                new_y = max(SCOOTER_RADIUS, min(WINDOW_HEIGHT - SCOOTER_RADIUS, new_y))
+                self.pos = Point(new_x, new_y)
+                
+                # Drain battery
+                self.battery = max(0, self.battery - BATTERY_DRAIN_RATE)
+    
+    def distance_to(self, point):
+        """Calculate distance to a point"""
+        dx = point.x - self.pos.x
+        dy = point.y - self.pos.y
+        return math.sqrt(dx * dx + dy * dy)
+
+
+class Pedestrian:
+    """Person walking to/from SPIN scooter"""
+    def __init__(self, x, y, target_scooter, user):
+        self.pos = Point(x, y)
+        self.target_scooter = target_scooter
+        self.target = target_scooter.pos
+        self.user = user
+        self.speed = PEDESTRIAN_SPEED
+        self.state = "walking_to_scooter"
+    
+    def update(self):
+        """Update pedestrian position"""
+        if self.state == "walking_to_scooter":
+            # Walk toward scooter
+            dx = self.target_scooter.pos.x - self.pos.x
+            dy = self.target_scooter.pos.y - self.pos.y
+            distance = math.sqrt(dx * dx + dy * dy)
+            
+            if distance < PICKUP_DISTANCE + 5:
+                # Reached scooter - start riding
+                self.state = "riding"
+                self.user.state = "riding_spin"
+                self.user.pos = self.target_scooter.pos
+            else:
+                # Move toward scooter
+                angle = math.atan2(dy, dx)
+                new_x = self.pos.x + math.cos(angle) * self.speed
+                new_y = self.pos.y + math.sin(angle) * self.speed
+                self.pos = Point(new_x, new_y)
+        elif self.state == "riding":
+            # Update position to match scooter
+            self.pos = self.target_scooter.pos
+            # Check if ride is complete
+            if self.user.state == "completed":
+                self.state = "walking_away"
+        elif self.state == "walking_away":
+            # Walk away from scooter (can despawn after a bit)
+            dx = self.pos.x - self.target_scooter.pos.x
+            dy = self.pos.y - self.target_scooter.pos.y
+            if abs(dx) < 1 and abs(dy) < 1:
+                dx = random.uniform(-1, 1)
+                dy = random.uniform(-1, 1)
+            angle = math.atan2(dy, dx)
+            new_x = self.pos.x + math.cos(angle) * self.speed
+            new_y = self.pos.y + math.sin(angle) * self.speed
+            self.pos = Point(new_x, new_y)
+
+
 class Simulation:
     """Main simulation class"""
     def __init__(self):
@@ -535,10 +666,13 @@ class Simulation:
         self.charge_stations = []
         self.obstacles = []
         self.landmarks = []
+        self.spin_scooters = []
+        self.pedestrians = []
         
         self._initialize_map()
         self._initialize_landmarks()
         self._initialize_scooters()
+        self._initialize_spin_scooters()
         
         # View mode
         self.view_mode = "aerial"  # "aerial" or "first_person"
@@ -546,6 +680,31 @@ class Simulation:
         
         # Two-click interaction state
         self.pending_user_origin = None
+        
+        # Slider for adding scooters
+        self.slider_x = 300
+        self.slider_y = 30
+        self.slider_width = 200
+        self.slider_height = 20
+        self.slider_min = 10
+        self.slider_max = 30
+        self.slider_value = len(self.scooters)  # Initialize to current count
+        self.slider_dragging = False
+        
+        # Comparison metrics
+        self.our_rides_count = 0
+        self.spin_rides_count = 0
+        self.our_ride_times = []  # List of trip durations
+        self.spin_ride_times = []  # List of trip durations
+        self.our_active_users = 0
+        self.spin_active_users = 0
+        self.ride_start_times = {}  # Track when rides started (by user)
+        
+        # Auto-spawn pedestrians (rate limited to 1 per second)
+        self.pedestrian_spawn_timer = 0
+        
+        # Auto-spawn pedestrians (rate limited)
+        self.pedestrian_spawn_timer = 0
     
     def _initialize_map(self):
         """Initialize map with obstacles and charge stations"""
@@ -584,20 +743,50 @@ class Simulation:
             self.landmarks.append(Landmark(name, x, y))
     
     def _initialize_scooters(self):
-        """Initialize scooters at charge stations"""
-        # Place scooters at charge stations initially
-        for i, station in enumerate(self.charge_stations[:NUM_SCOOTERS]):
-            scooter = Scooter(station.pos.x, station.pos.y)
-            scooter.target_station = station
-            scooter.origin_dock = station
-            scooter.state = ScooterState.IDLE
-            self.scooters.append(scooter)
-        
-        # If more scooters than stations, place rest randomly
-        for _ in range(NUM_SCOOTERS - len(self.scooters)):
+        """Initialize scooters at random positions"""
+        # Place all scooters randomly on the map
+        for _ in range(NUM_SCOOTERS):
             x = random.randint(SCOOTER_RADIUS * 2, WINDOW_WIDTH - SCOOTER_RADIUS * 2)
             y = random.randint(SCOOTER_RADIUS * 2, WINDOW_HEIGHT - SCOOTER_RADIUS * 2)
             self.scooters.append(Scooter(x, y))
+    
+    def _initialize_spin_scooters(self):
+        """Initialize SPIN competitor scooters at random positions"""
+        for _ in range(NUM_SPIN_SCOOTERS):
+            x = random.randint(SCOOTER_RADIUS * 2, WINDOW_WIDTH - SCOOTER_RADIUS * 2)
+            y = random.randint(SCOOTER_RADIUS * 2, WINDOW_HEIGHT - SCOOTER_RADIUS * 2)
+            self.spin_scooters.append(SpinScooter(x, y))
+    
+    def _add_scooter(self):
+        """Dynamically add a new scooter at random position"""
+        # Place randomly on the map
+        x = random.randint(SCOOTER_RADIUS * 2, WINDOW_WIDTH - SCOOTER_RADIUS * 2)
+        y = random.randint(SCOOTER_RADIUS * 2, WINDOW_HEIGHT - SCOOTER_RADIUS * 2)
+        scooter = Scooter(x, y)
+        self.scooters.append(scooter)
+        self.slider_value = len(self.scooters)
+    
+    def _adjust_scooter_count(self):
+        """Adjust scooter count based on slider value"""
+        target_count = self.slider_value
+        current_count = len(self.scooters)
+        
+        if target_count > current_count:
+            # Add scooters
+            for _ in range(target_count - current_count):
+                self._add_scooter()
+        elif target_count < current_count:
+            # Remove scooters (remove idle ones first)
+            to_remove = current_count - target_count
+            removed = 0
+            for scooter in self.scooters[:]:
+                if scooter.state == ScooterState.IDLE and removed < to_remove:
+                    self.scooters.remove(scooter)
+                    removed += 1
+            # If still need to remove, remove any
+            while removed < to_remove and self.scooters:
+                self.scooters.pop()
+                removed += 1
     
     def handle_events(self):
         """Handle pygame events"""
@@ -607,7 +796,16 @@ class Simulation:
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:  # Left click
                     x, y = event.pos
-                    if self.pending_user_origin is None:
+                    # Check if clicking on slider
+                    slider_rect = pygame.Rect(self.slider_x, self.slider_y, self.slider_width, self.slider_height)
+                    if slider_rect.collidepoint(x, y):
+                        self.slider_dragging = True
+                        # Update slider value based on click position
+                        rel_x = x - self.slider_x
+                        self.slider_value = int(self.slider_min + (rel_x / self.slider_width) * (self.slider_max - self.slider_min))
+                        self.slider_value = max(self.slider_min, min(self.slider_max, self.slider_value))
+                        self._adjust_scooter_count()
+                    elif self.pending_user_origin is None:
                         # First click: set origin
                         self.pending_user_origin = Point(x, y)
                     else:
@@ -639,6 +837,19 @@ class Simulation:
                 elif event.key == pygame.K_a:
                     # Return to aerial view
                     self.view_mode = "aerial"
+                elif event.key == pygame.K_EQUALS or (event.key == pygame.K_PLUS and event.mod & pygame.KMOD_SHIFT):
+                    # Add a new scooter (+ key)
+                    self._add_scooter()
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    self.slider_dragging = False
+            elif event.type == pygame.MOUSEMOTION:
+                if self.slider_dragging:
+                    x, y = event.pos
+                    rel_x = x - self.slider_x
+                    self.slider_value = int(self.slider_min + (rel_x / self.slider_width) * (self.slider_max - self.slider_min))
+                    self.slider_value = max(self.slider_min, min(self.slider_max, self.slider_value))
+                    self._adjust_scooter_count()
         
         # Handle continuous key presses for first-person manual controls
         if self.view_mode == "first_person" and self.scooters:
@@ -673,7 +884,8 @@ class Simulation:
         return True
     
     def _assign_user_to_scooter(self, user):
-        """Assign user to closest idle scooter"""
+        """Assign user to closest idle scooter (ours first, then SPIN)"""
+        # First, try to assign to our scooters
         min_dist = float('inf')
         closest_scooter = None
         
@@ -686,26 +898,174 @@ class Simulation:
         
         if closest_scooter:
             closest_scooter.assign_user(user)
-        # If no idle scooter, user will wait (shown in queue)
+            # Track ride start time
+            self.ride_start_times[id(user)] = pygame.time.get_ticks()
+            self.our_active_users += 1
+            return
+        
+        # If no idle our scooter, assign to SPIN
+        min_dist = float('inf')
+        closest_spin = None
+        
+        for spin_scooter in self.spin_scooters:
+            if spin_scooter.available:
+                dist = spin_scooter.distance_to(user.origin)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_spin = spin_scooter
+        
+        if closest_spin:
+            closest_spin.assign_user(user)
+            # Create pedestrian to walk to SPIN scooter
+            pedestrian = Pedestrian(user.origin.x, user.origin.y, closest_spin, user)
+            self.pedestrians.append(pedestrian)
+            # Track ride start time
+            self.ride_start_times[id(user)] = pygame.time.get_ticks()
+            self.spin_active_users += 1
+        # If no scooter available, user will wait (shown in queue)
+    
+    def _spawn_pedestrian_user(self, use_our_scooters=True):
+        """Spawn a new pedestrian/user at random location"""
+        # Random origin
+        origin_x = random.randint(50, WINDOW_WIDTH - 50)
+        origin_y = random.randint(50, WINDOW_HEIGHT - 50)
+        
+        # Random destination (either landmark or random point)
+        if random.random() < 0.5 and self.landmarks:
+            destination = random.choice(self.landmarks)
+        else:
+            dest_x = random.randint(50, WINDOW_WIDTH - 50)
+            dest_y = random.randint(50, WINDOW_HEIGHT - 50)
+            destination = Point(dest_x, dest_y)
+        
+        user = User(origin_x, origin_y, destination)
+        self.users.append(user)
+        
+        if use_our_scooters:
+            # Force assign to our scooter (if available)
+            min_dist = float('inf')
+            closest_scooter = None
+            for scooter in self.scooters:
+                if scooter.state == ScooterState.IDLE and scooter.battery > 0:
+                    dist = scooter.distance_to(user.origin)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_scooter = scooter
+            if closest_scooter:
+                closest_scooter.assign_user(user)
+                self.ride_start_times[id(user)] = pygame.time.get_ticks()
+                self.our_active_users += 1
+        else:
+            # Force assign to SPIN
+            min_dist = float('inf')
+            closest_spin = None
+            for spin_scooter in self.spin_scooters:
+                if spin_scooter.available:
+                    dist = spin_scooter.distance_to(user.origin)
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_spin = spin_scooter
+            if closest_spin:
+                closest_spin.assign_user(user)
+                pedestrian = Pedestrian(user.origin.x, user.origin.y, closest_spin, user)
+                self.pedestrians.append(pedestrian)
+                self.ride_start_times[id(user)] = pygame.time.get_ticks()
+                self.spin_active_users += 1
+    
+    def _maintain_pedestrian_count(self):
+        """Maintain target pedestrian counts (3 our, 3 SPIN) - spawn max 1 per second"""
+        # Rate limiting: only spawn one pedestrian per second
+        self.pedestrian_spawn_timer += 1
+        if self.pedestrian_spawn_timer < PEDESTRIAN_SPAWN_INTERVAL:
+            return  # Wait for next second
+        
+        # Reset timer
+        self.pedestrian_spawn_timer = 0
+        
+        # Count current active pedestrians/users for our scooters
+        our_count = sum(1 for u in self.users 
+                       if hasattr(u, 'assigned_scooter') and u.assigned_scooter and 
+                       not isinstance(u.assigned_scooter, SpinScooter) and
+                       u.state != "completed")
+        
+        # Count SPIN users and pedestrians
+        spin_user_count = sum(1 for u in self.users 
+                             if hasattr(u, 'assigned_scooter') and u.assigned_scooter and 
+                             isinstance(u.assigned_scooter, SpinScooter) and
+                             u.state != "completed")
+        spin_pedestrian_count = sum(1 for p in self.pedestrians 
+                                    if p.state in ["walking_to_scooter", "riding"])
+        spin_count = spin_user_count + spin_pedestrian_count
+        
+        # Spawn ONE pedestrian per second (prioritize whichever is lower)
+        if our_count < TARGET_PEDESTRIANS_OUR and spin_count < TARGET_PEDESTRIANS_SPIN:
+            # Both need more - spawn the one that's further below target
+            our_deficit = TARGET_PEDESTRIANS_OUR - our_count
+            spin_deficit = TARGET_PEDESTRIANS_SPIN - spin_count
+            if our_deficit >= spin_deficit:
+                self._spawn_pedestrian_user(use_our_scooters=True)
+            else:
+                self._spawn_pedestrian_user(use_our_scooters=False)
+        elif our_count < TARGET_PEDESTRIANS_OUR:
+            self._spawn_pedestrian_user(use_our_scooters=True)
+        elif spin_count < TARGET_PEDESTRIANS_SPIN:
+            self._spawn_pedestrian_user(use_our_scooters=False)
     
     def update(self):
         """Update all game objects"""
-        # Update scooters
+        # Update our scooters
         for scooter in self.scooters:
             scooter.update(self.users, self.charge_stations, self.obstacles, self.scooters)
+        
+        # Update SPIN scooters
+        for spin_scooter in self.spin_scooters:
+            spin_scooter.update(self.obstacles)
+        
+        # Update pedestrians
+        for pedestrian in self.pedestrians[:]:
+            pedestrian.update()
+            # Remove pedestrians that are walking away and far enough
+            if pedestrian.state == "walking_away":
+                dist = math.sqrt((pedestrian.pos.x - pedestrian.target_scooter.pos.x)**2 + 
+                               (pedestrian.pos.y - pedestrian.target_scooter.pos.y)**2)
+                if dist > 100:  # Far enough away
+                    self.pedestrians.remove(pedestrian)
         
         # Update users
         for user in self.users[:]:
             user.update()
-            # Remove users that have been completed
+            
+            # Track completed rides and metrics
             if user.state == "completed":
+                # Calculate ride duration
+                user_id = id(user)
+                if user_id in self.ride_start_times:
+                    ride_duration = (pygame.time.get_ticks() - self.ride_start_times[user_id]) / 1000.0  # seconds
+                    
+                    # Determine if it was our scooter or SPIN
+                    if hasattr(user, 'assigned_scooter'):
+                        if isinstance(user.assigned_scooter, SpinScooter):
+                            self.spin_rides_count += 1
+                            self.spin_ride_times.append(ride_duration)
+                            self.spin_active_users = max(0, self.spin_active_users - 1)
+                        else:
+                            self.our_rides_count += 1
+                            self.our_ride_times.append(ride_duration)
+                            self.our_active_users = max(0, self.our_active_users - 1)
+                    
+                    del self.ride_start_times[user_id]
+                
+                # Remove completed user
                 if user in self.users:
                     self.users.remove(user)
         
         # Check for unassigned users and try to assign them
         for user in self.users:
-            if user.assigned_scooter is None:
+            if user.assigned_scooter is None and user.state == "waiting":
                 self._assign_user_to_scooter(user)
+        
+        # Auto-spawn pedestrians to maintain target counts
+        self._maintain_pedestrian_count()
     
     def draw_aerial_view(self):
         """Draw aerial top-down view"""
@@ -764,7 +1124,65 @@ class Simulation:
                 text_rect = text.get_rect(center=(int(user.origin.x), int(user.origin.y)))
                 self.screen.blit(text, text_rect)
         
-        # Draw scooters
+        # Draw SPIN scooters
+        for spin_scooter in self.spin_scooters:
+            color = SPIN_COLOR if spin_scooter.available else (200, 50, 50)
+            # Draw scooter circle
+            pygame.draw.circle(self.screen, color, (int(spin_scooter.pos.x), int(spin_scooter.pos.y)), SCOOTER_RADIUS)
+            # Draw direction arrow if moving
+            if spin_scooter.velocity > 0:
+                arrow_length = SCOOTER_RADIUS + 5
+                end_x = spin_scooter.pos.x + math.cos(spin_scooter.angle) * arrow_length
+                end_y = spin_scooter.pos.y + math.sin(spin_scooter.angle) * arrow_length
+                pygame.draw.line(self.screen, COLOR_TEXT, 
+                               (int(spin_scooter.pos.x), int(spin_scooter.pos.y)),
+                               (int(end_x), int(end_y)), 2)
+            # Draw "SPIN" label
+            text = self.small_font.render("SPIN", True, COLOR_TEXT)
+            text_rect = text.get_rect(center=(int(spin_scooter.pos.x), int(spin_scooter.pos.y)))
+            self.screen.blit(text, text_rect)
+        
+        # Draw pedestrians (MAKE THEM IMPOSSIBLE TO MISS!)
+        for pedestrian in self.pedestrians:
+            # ALWAYS draw pedestrians - make them HUGE and BRIGHT
+            if pedestrian.state == "walking_to_scooter":
+                color = (255, 0, 255)  # Bright magenta
+                radius = 15  # MUCH larger
+            elif pedestrian.state == "riding":
+                color = (200, 0, 200)  # Purple
+                radius = 12
+            else:
+                color = (150, 0, 150)  # Darker purple
+                radius = 10
+            
+            # Draw main circle - VERY VISIBLE
+            pygame.draw.circle(self.screen, color, 
+                             (int(pedestrian.pos.x), int(pedestrian.pos.y)), 
+                             radius)
+            # Draw thick white outline for maximum visibility
+            pygame.draw.circle(self.screen, (255, 255, 255), 
+                             (int(pedestrian.pos.x), int(pedestrian.pos.y)), 
+                             radius, 3)
+            # Draw inner yellow highlight
+            pygame.draw.circle(self.screen, (255, 255, 0), 
+                             (int(pedestrian.pos.x), int(pedestrian.pos.y)), 
+                             radius - 4)
+            
+            # Draw line to target if walking to scooter - BRIGHT YELLOW
+            if pedestrian.state == "walking_to_scooter":
+                pygame.draw.line(self.screen, (255, 255, 0),  # Bright yellow line
+                               (int(pedestrian.pos.x), int(pedestrian.pos.y)),
+                               (int(pedestrian.target_scooter.pos.x), int(pedestrian.target_scooter.pos.y)), 4)
+                # Draw arrow pointing to scooter
+                dx = pedestrian.target_scooter.pos.x - pedestrian.pos.x
+                dy = pedestrian.target_scooter.pos.y - pedestrian.pos.y
+                if dx != 0 or dy != 0:
+                    angle = math.atan2(dy, dx)
+                    arrow_x = pedestrian.pos.x + math.cos(angle) * (radius + 8)
+                    arrow_y = pedestrian.pos.y + math.sin(angle) * (radius + 8)
+                    pygame.draw.circle(self.screen, (255, 255, 0), (int(arrow_x), int(arrow_y)), 5)
+        
+        # Draw our scooters
         for scooter in self.scooters:
             color = scooter.get_color()
             # Draw scooter circle
@@ -786,31 +1204,102 @@ class Simulation:
         self._draw_hud()
     
     def _draw_hud(self):
-        """Draw HUD overlay with fleet stats"""
-        # Calculate stats
+        """Draw HUD overlay with fleet stats and comparison metrics"""
+        # Calculate our stats
         idle_count = sum(1 for s in self.scooters if s.state == ScooterState.IDLE)
         idle_percent = (idle_count / len(self.scooters)) * 100 if self.scooters else 0
         avg_battery = sum(s.battery for s in self.scooters) / len(self.scooters) if self.scooters else 0
-        active_users = len(self.users)
         
-        # Draw HUD background
-        hud_rect = pygame.Rect(10, 10, 250, 100)
-        pygame.draw.rect(self.screen, (0, 0, 0, 180), hud_rect)
+        # Calculate comparison metrics
+        our_avg_time = sum(self.our_ride_times) / len(self.our_ride_times) if self.our_ride_times else 0
+        spin_avg_time = sum(self.spin_ride_times) / len(self.spin_ride_times) if self.spin_ride_times else 0
+        
+        # Draw main HUD background
+        hud_rect = pygame.Rect(10, 10, 280, 140)
+        pygame.draw.rect(self.screen, (0, 0, 0, 200), hud_rect)
         pygame.draw.rect(self.screen, (255, 255, 255), hud_rect, 2)
         
         # Draw stats
         y_offset = 20
         stats = [
-            f"Idle: {idle_percent:.1f}% ({idle_count}/{len(self.scooters)})",
-            f"Avg Battery: {avg_battery:.1f}%",
-            f"Active Users: {active_users}",
-            f"Click 1: origin, Click 2: destination"
+            f"Our Scooters: {len(self.scooters)}",
+            f"Idle: {idle_percent:.1f}% | Battery: {avg_battery:.1f}%",
+            f"Click 1: origin, Click 2: destination",
+            f"Press '+' to add scooter"
         ]
         
         for stat in stats:
             text = self.small_font.render(stat, True, COLOR_TEXT)
             self.screen.blit(text, (20, y_offset))
-            y_offset += 20
+            y_offset += 18
+        
+        # Draw slider for scooter count
+        slider_label = self.small_font.render("Scooters:", True, COLOR_TEXT)
+        self.screen.blit(slider_label, (20, y_offset))
+        
+        # Slider track
+        slider_rect = pygame.Rect(self.slider_x, self.slider_y, self.slider_width, self.slider_height)
+        pygame.draw.rect(self.screen, (100, 100, 100), slider_rect)
+        pygame.draw.rect(self.screen, (200, 200, 200), slider_rect, 2)
+        
+        # Slider handle position
+        handle_pos = self.slider_x + ((self.slider_value - self.slider_min) / (self.slider_max - self.slider_min)) * self.slider_width
+        handle_rect = pygame.Rect(int(handle_pos - 5), self.slider_y - 2, 10, self.slider_height + 4)
+        pygame.draw.rect(self.screen, (100, 200, 255), handle_rect)
+        pygame.draw.rect(self.screen, (255, 255, 255), handle_rect, 2)
+        
+        # Slider value text
+        value_text = self.small_font.render(str(self.slider_value), True, COLOR_TEXT)
+        self.screen.blit(value_text, (self.slider_x + self.slider_width + 10, self.slider_y))
+        
+        # Draw comparison panel
+        comp_rect = pygame.Rect(10, 160, 350, 120)
+        pygame.draw.rect(self.screen, (0, 0, 0, 200), comp_rect)
+        pygame.draw.rect(self.screen, (255, 255, 255), comp_rect, 2)
+        
+        y_offset = 170
+        # Header
+        header_text = self.small_font.render("COMPARISON METRICS", True, (255, 255, 0))
+        self.screen.blit(header_text, (20, y_offset))
+        y_offset += 20
+        
+        # Our rides
+        our_text = self.small_font.render(f"OUR Rides: {self.our_rides_count}", True, (50, 200, 255))
+        self.screen.blit(our_text, (20, y_offset))
+        if self.our_ride_times:
+            time_text = self.small_font.render(f"  Avg Time: {our_avg_time:.1f}s", True, (150, 200, 255))
+            self.screen.blit(time_text, (180, y_offset))
+        y_offset += 18
+        
+        # SPIN rides
+        spin_text = self.small_font.render(f"SPIN Rides: {self.spin_rides_count}", True, SPIN_COLOR)
+        self.screen.blit(spin_text, (20, y_offset))
+        if self.spin_ride_times:
+            time_text = self.small_font.render(f"  Avg Time: {spin_avg_time:.1f}s", True, (255, 150, 100))
+            self.screen.blit(time_text, (180, y_offset))
+        y_offset += 18
+        
+        # Active users
+        active_text = self.small_font.render(f"Active: Our {self.our_active_users} | SPIN {self.spin_active_users}", True, COLOR_TEXT)
+        self.screen.blit(active_text, (20, y_offset))
+        y_offset += 18
+        
+        # DEBUG: Show pedestrian count
+        ped_text = self.small_font.render(f"Pedestrians: {len(self.pedestrians)}", True, (255, 255, 0))
+        self.screen.blit(ped_text, (20, y_offset))
+        
+        # Visual comparison bar
+        total_rides = self.our_rides_count + self.spin_rides_count
+        if total_rides > 0:
+            bar_width = 300
+            our_width = int((self.our_rides_count / total_rides) * bar_width)
+            bar_y = y_offset + 20
+            # Our bar (blue)
+            pygame.draw.rect(self.screen, (50, 200, 255), (20, bar_y, our_width, 15))
+            # SPIN bar (orange)
+            pygame.draw.rect(self.screen, SPIN_COLOR, (20 + our_width, bar_y, bar_width - our_width, 15))
+            # Border
+            pygame.draw.rect(self.screen, (255, 255, 255), (20, bar_y, bar_width, 15), 1)
     
     def draw_first_person_view(self):
         """Draw realistic first-person road perspective view"""
