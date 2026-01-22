@@ -51,6 +51,22 @@ STEERING_FACTOR = 0.1
 MIN_RIDE_TIME = 600  # frames (10 seconds at 60 FPS)
 MAX_RIDE_TIME = 1200  # frames (20 seconds at 60 FPS)
 
+# Collision avoidance constants
+COLLISION_AVOIDANCE_DISTANCE = 30  # For scooters
+SEPARATION_FORCE_MULTIPLIER = 2.0
+
+# Landmark constants
+LANDMARK_SIZE = 35
+LANDMARK_COLORS = {
+    "Library": (50, 100, 255),      # Blue
+    "Restaurant": (255, 165, 0),   # Orange
+    "Church": (200, 100, 255),     # Purple
+    "Park": (50, 200, 50),         # Green
+    "School": (255, 255, 0),        # Yellow
+    "Hospital": (255, 50, 50),     # Red
+}
+LANDMARK_NAMES = list(LANDMARK_COLORS.keys())
+
 # Point namedtuple for 2D coordinates
 Point = namedtuple('Point', ['x', 'y'])
 
@@ -59,6 +75,7 @@ class ScooterState(Enum):
     """Scooter state enumeration"""
     IDLE = "idle"
     TO_USER = "to_user"
+    TO_DESTINATION = "to_destination"
     CARRYING = "carrying"
     RETURNING = "returning"
     CHARGING = "charging"
@@ -104,12 +121,37 @@ class ChargeStation:
         return expanded.collidepoint(point.x, point.y)
 
 
+class Landmark:
+    """Programmed place on the map (library, restaurant, etc.)"""
+    def __init__(self, name, x, y):
+        self.name = name
+        self.pos = Point(x, y)
+        self.color = LANDMARK_COLORS.get(name, (150, 150, 150))
+        self.rect = pygame.Rect(x - LANDMARK_SIZE // 2, 
+                               y - LANDMARK_SIZE // 2,
+                               LANDMARK_SIZE, LANDMARK_SIZE)
+    
+    def distance_to(self, point):
+        """Calculate distance to a point"""
+        dx = point.x - self.pos.x
+        dy = point.y - self.pos.y
+        return math.sqrt(dx * dx + dy * dy)
+    
+    def contains_point(self, point, margin=0):
+        """Check if point is within landmark (with optional margin)"""
+        expanded = self.rect.inflate(margin * 2, margin * 2)
+        return expanded.collidepoint(point.x, point.y)
+
+
 class User:
     """User request entity"""
-    def __init__(self, x, y):
-        self.pos = Point(x, y)
+    def __init__(self, origin_x, origin_y, destination=None):
+        self.origin = Point(origin_x, origin_y)
+        self.pos = self.origin  # Current position (starts at origin)
+        self.destination = destination  # Point or Landmark
         self.pulse_phase = 0.0
         self.assigned_scooter = None
+        self.state = "waiting"  # "waiting", "picked_up", "completed"
     
     def update(self):
         """Update user animation"""
@@ -120,6 +162,12 @@ class User:
         dx = point.x - self.pos.x
         dy = point.y - self.pos.y
         return math.sqrt(dx * dx + dy * dy)
+    
+    def get_destination_point(self):
+        """Get destination as Point (if Landmark, return its position)"""
+        if isinstance(self.destination, Landmark):
+            return self.destination.pos
+        return self.destination
 
 
 class Scooter:
@@ -129,11 +177,13 @@ class Scooter:
         self.velocity = 0.0
         self.angle = random.uniform(0, 2 * math.pi)
         self.target = None
+        self.destination = None  # Final destination for current ride
         self.state = ScooterState.IDLE
         self.battery = 100.0
         self.carrying_user = None
         self.ride_timer = 0
         self.target_station = None
+        self.origin_dock = None  # Dock where scooter started from
     
     def distance_to(self, point):
         """Calculate distance to a point"""
@@ -160,6 +210,8 @@ class Scooter:
             self._update_idle()
         elif self.state == ScooterState.TO_USER:
             self._update_to_user(obstacles, scooters)
+        elif self.state == ScooterState.TO_DESTINATION:
+            self._update_to_destination(obstacles, scooters)
         elif self.state == ScooterState.CARRYING:
             self._update_carrying(obstacles, scooters)
         elif self.state == ScooterState.RETURNING:
@@ -184,10 +236,15 @@ class Scooter:
             self.battery = max(0, self.battery - BATTERY_DRAIN_RATE)
     
     def _update_idle(self):
-        """Idle state: slight random wander"""
-        if random.random() < 0.02:  # Occasionally change direction
-            self.angle += random.uniform(-0.5, 0.5)
-        self.velocity = random.uniform(0.5, 1.5)
+        """Idle state: stay at dock or slight random wander"""
+        # If at a dock, stay put
+        if self.target_station and self.target_station.contains_point(self.pos, margin=CHARGE_STATION_SIZE // 2):
+            self.velocity = 0.0
+        else:
+            # Not at dock - slight random wander
+            if random.random() < 0.02:  # Occasionally change direction
+                self.angle += random.uniform(-0.5, 0.5)
+            self.velocity = random.uniform(0.5, 1.5)
     
     def _update_to_user(self, obstacles, scooters):
         """Move toward target user"""
@@ -201,16 +258,65 @@ class Scooter:
         distance = math.sqrt(dx * dx + dy * dy)
         
         if distance < PICKUP_DISTANCE:
-            # Reached user - switch to carrying
-            self.state = ScooterState.CARRYING
-            self.carrying_user = self.target
-            self.target = None
-            self.ride_timer = random.randint(MIN_RIDE_TIME, MAX_RIDE_TIME)
+            # Reached user - switch to TO_DESTINATION
+            if self.carrying_user and self.carrying_user.destination:
+                self.carrying_user.state = "picked_up"
+                self.destination = self.carrying_user.get_destination_point()
+                self.target = self.destination
+                self.state = ScooterState.TO_DESTINATION
+            else:
+                # Fallback to old behavior (no destination set)
+                self.state = ScooterState.CARRYING
+                self.target = None
+                self.ride_timer = random.randint(MIN_RIDE_TIME, MAX_RIDE_TIME)
             return
         
         desired_angle = math.atan2(dy, dx)
         
         # Steer toward target
+        angle_diff = desired_angle - self.angle
+        # Normalize angle difference to [-pi, pi]
+        while angle_diff > math.pi:
+            angle_diff -= 2 * math.pi
+        while angle_diff < -math.pi:
+            angle_diff += 2 * math.pi
+        
+        self.angle += angle_diff * STEERING_FACTOR
+        
+        # Obstacle avoidance
+        self._avoid_obstacles(obstacles, scooters)
+        
+        # Set velocity
+        self.velocity = min(MAX_SPEED, distance * 0.1)
+    
+    def _update_to_destination(self, obstacles, scooters):
+        """Navigate to user's destination"""
+        if self.target is None or self.destination is None:
+            # No destination - fallback to returning
+            self.state = ScooterState.RETURNING
+            if self.carrying_user:
+                self.carrying_user.state = "completed"
+                self.carrying_user = None
+            return
+        
+        # Calculate desired angle to destination
+        dx = self.target.x - self.pos.x
+        dy = self.target.y - self.pos.y
+        distance = math.sqrt(dx * dx + dy * dy)
+        
+        if distance < PICKUP_DISTANCE:
+            # Reached destination - drop off user
+            if self.carrying_user:
+                self.carrying_user.state = "completed"
+                self.carrying_user = None
+            self.destination = None
+            self.target = None
+            self.state = ScooterState.RETURNING
+            return
+        
+        desired_angle = math.atan2(dy, dx)
+        
+        # Steer toward destination
         angle_diff = desired_angle - self.angle
         # Normalize angle difference to [-pi, pi]
         while angle_diff > math.pi:
@@ -297,8 +403,21 @@ class Scooter:
             self.state = ScooterState.IDLE
             self.target_station = None
     
+    def _predict_collision(self, other_scooter, lookahead_frames=5):
+        """Predict if collision will occur in next few frames"""
+        # Calculate future positions
+        my_future_x = self.pos.x + math.cos(self.angle) * self.velocity * lookahead_frames
+        my_future_y = self.pos.y + math.sin(self.angle) * self.velocity * lookahead_frames
+        other_future_x = other_scooter.pos.x + math.cos(other_scooter.angle) * other_scooter.velocity * lookahead_frames
+        other_future_y = other_scooter.pos.y + math.sin(other_scooter.angle) * other_scooter.velocity * lookahead_frames
+        
+        future_dist = math.sqrt((my_future_x - other_future_x)**2 + (my_future_y - other_future_y)**2)
+        return future_dist < (SCOOTER_RADIUS * 2 + 10)
+    
     def _avoid_obstacles(self, obstacles, scooters):
-        """Steer away from nearby obstacles and other scooters"""
+        """Enhanced obstacle and scooter avoidance with separation forces and predictive collision"""
+        separation_force_x = 0.0
+        separation_force_y = 0.0
         avoidance_angle = 0.0
         avoidance_count = 0
         
@@ -313,19 +432,50 @@ class Scooter:
                 avoidance_angle += avoid_angle
                 avoidance_count += 1
         
-        # Check other scooters
+        # Enhanced scooter avoidance with separation forces
         for scooter in scooters:
             if scooter is self or scooter.state == ScooterState.DEAD:
                 continue
+            
             dx = self.pos.x - scooter.pos.x
             dy = self.pos.y - scooter.pos.y
             dist = math.sqrt(dx * dx + dy * dy)
-            if dist < OBSTACLE_AVOIDANCE_DISTANCE and dist > 0:
-                avoid_angle = math.atan2(dy, dx)
-                avoidance_angle += avoid_angle
-                avoidance_count += 1
+            
+            if dist < COLLISION_AVOIDANCE_DISTANCE and dist > 0:
+                # Separation force (stronger when closer)
+                force_strength = SEPARATION_FORCE_MULTIPLIER * (1.0 - dist / COLLISION_AVOIDANCE_DISTANCE)
+                separation_force_x += (dx / dist) * force_strength
+                separation_force_y += (dy / dist) * force_strength
+                
+                # Predictive collision check
+                if self._predict_collision(scooter):
+                    # Stronger avoidance if collision predicted
+                    avoid_angle = math.atan2(dy, dx)
+                    avoidance_angle += avoid_angle * 2.0
+                    avoidance_count += 2
+                else:
+                    avoid_angle = math.atan2(dy, dx)
+                    avoidance_angle += avoid_angle
+                    avoidance_count += 1
+                
+                # Velocity matching (align with nearby scooters to reduce conflicts)
+                if dist < COLLISION_AVOIDANCE_DISTANCE * 0.7:
+                    # Slight velocity alignment
+                    target_vel = scooter.velocity
+                    self.velocity = self.velocity * 0.9 + target_vel * 0.1
         
-        # Apply avoidance
+        # Apply separation force
+        if separation_force_x != 0 or separation_force_y != 0:
+            separation_angle = math.atan2(separation_force_y, separation_force_x)
+            angle_diff = separation_angle - self.angle
+            while angle_diff > math.pi:
+                angle_diff -= 2 * math.pi
+            while angle_diff < -math.pi:
+                angle_diff += 2 * math.pi
+            # Strong separation adjustment
+            self.angle += angle_diff * 0.3
+        
+        # Apply avoidance angle
         if avoidance_count > 0:
             avoidance_angle /= avoidance_count
             angle_diff = avoidance_angle - self.angle
@@ -337,7 +487,11 @@ class Scooter:
     
     def assign_user(self, user):
         """Assign a user to this scooter"""
-        self.target = user.pos
+        self.target = user.origin  # Target is user's origin (pickup location)
+        self.carrying_user = user  # Store user object for later
+        # Record origin dock when leaving IDLE state
+        if self.state == ScooterState.IDLE and self.target_station:
+            self.origin_dock = self.target_station
         self.state = ScooterState.TO_USER
         user.assigned_scooter = self
     
@@ -357,6 +511,7 @@ class Scooter:
         labels = {
             ScooterState.IDLE: "I",
             ScooterState.TO_USER: "U",
+            ScooterState.TO_DESTINATION: "D",
             ScooterState.CARRYING: "C",
             ScooterState.RETURNING: "R",
             ScooterState.CHARGING: "⚡",
@@ -379,13 +534,18 @@ class Simulation:
         self.users = []
         self.charge_stations = []
         self.obstacles = []
+        self.landmarks = []
         
         self._initialize_map()
+        self._initialize_landmarks()
         self._initialize_scooters()
         
         # View mode
         self.view_mode = "aerial"  # "aerial" or "first_person"
         self.fp_scooter_index = 0
+        
+        # Two-click interaction state
+        self.pending_user_origin = None
     
     def _initialize_map(self):
         """Initialize map with obstacles and charge stations"""
@@ -408,9 +568,33 @@ class Simulation:
         for i, (x, y) in enumerate(positions[:NUM_CHARGE_STATIONS]):
             self.charge_stations.append(ChargeStation(x, y))
     
+    def _initialize_landmarks(self):
+        """Initialize landmarks on the map"""
+        # Place landmarks at strategic locations
+        landmark_positions = [
+            ("Library", 200, 200),
+            ("Restaurant", 800, 300),
+            ("Church", 400, 600),
+            ("Park", 1000, 500),
+            ("School", 600, 150),
+            ("Hospital", 300, 400),
+        ]
+        
+        for name, x, y in landmark_positions:
+            self.landmarks.append(Landmark(name, x, y))
+    
     def _initialize_scooters(self):
-        """Initialize scooters at random positions"""
-        for _ in range(NUM_SCOOTERS):
+        """Initialize scooters at charge stations"""
+        # Place scooters at charge stations initially
+        for i, station in enumerate(self.charge_stations[:NUM_SCOOTERS]):
+            scooter = Scooter(station.pos.x, station.pos.y)
+            scooter.target_station = station
+            scooter.origin_dock = station
+            scooter.state = ScooterState.IDLE
+            self.scooters.append(scooter)
+        
+        # If more scooters than stations, place rest randomly
+        for _ in range(NUM_SCOOTERS - len(self.scooters)):
             x = random.randint(SCOOTER_RADIUS * 2, WINDOW_WIDTH - SCOOTER_RADIUS * 2)
             y = random.randint(SCOOTER_RADIUS * 2, WINDOW_HEIGHT - SCOOTER_RADIUS * 2)
             self.scooters.append(Scooter(x, y))
@@ -423,11 +607,29 @@ class Simulation:
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:  # Left click
                     x, y = event.pos
-                    # Spawn user
-                    user = User(x, y)
-                    self.users.append(user)
-                    # Auto-assign to closest idle scooter
-                    self._assign_user_to_scooter(user)
+                    if self.pending_user_origin is None:
+                        # First click: set origin
+                        self.pending_user_origin = Point(x, y)
+                    else:
+                        # Second click: set destination and create user
+                        destination = None
+                        # Check if click is on a landmark
+                        for landmark in self.landmarks:
+                            if landmark.contains_point(Point(x, y), margin=20):
+                                destination = landmark
+                                break
+                        
+                        # If not on landmark, use click position
+                        if destination is None:
+                            destination = Point(x, y)
+                        
+                        # Create user with origin and destination
+                        user = User(self.pending_user_origin.x, self.pending_user_origin.y, destination)
+                        self.users.append(user)
+                        # Auto-assign to closest idle scooter
+                        self._assign_user_to_scooter(user)
+                        # Reset pending origin
+                        self.pending_user_origin = None
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_1:
                     # Toggle first-person view
@@ -477,7 +679,7 @@ class Simulation:
         
         for scooter in self.scooters:
             if scooter.state == ScooterState.IDLE and scooter.battery > 0:
-                dist = scooter.distance_to(user.pos)
+                dist = scooter.distance_to(user.origin)
                 if dist < min_dist:
                     min_dist = dist
                     closest_scooter = scooter
@@ -495,8 +697,8 @@ class Simulation:
         # Update users
         for user in self.users[:]:
             user.update()
-            # Remove users that have been picked up
-            if user.assigned_scooter and user.assigned_scooter.carrying_user != user:
+            # Remove users that have been completed
+            if user.state == "completed":
                 if user in self.users:
                     self.users.remove(user)
         
@@ -514,6 +716,13 @@ class Simulation:
         for obstacle in self.obstacles:
             pygame.draw.rect(self.screen, COLOR_OBSTACLE, obstacle.rect)
         
+        # Draw landmarks
+        for landmark in self.landmarks:
+            pygame.draw.rect(self.screen, landmark.color, landmark.rect)
+            text = self.small_font.render(landmark.name, True, COLOR_TEXT)
+            text_rect = text.get_rect(center=(landmark.pos.x, landmark.pos.y))
+            self.screen.blit(text, text_rect)
+        
         # Draw charge stations
         for station in self.charge_stations:
             pygame.draw.rect(self.screen, COLOR_CHARGE_STATION, station.rect)
@@ -521,16 +730,38 @@ class Simulation:
             text_rect = text.get_rect(center=(station.pos.x, station.pos.y))
             self.screen.blit(text, text_rect)
         
+        # Draw pending user origin (if waiting for destination click)
+        if self.pending_user_origin:
+            pygame.draw.circle(self.screen, (255, 200, 0), 
+                             (int(self.pending_user_origin.x), int(self.pending_user_origin.y)), 
+                             USER_RADIUS + 3, 2)
+            text = self.small_font.render("Click destination", True, (255, 255, 0))
+            text_rect = text.get_rect(center=(int(self.pending_user_origin.x), 
+                                            int(self.pending_user_origin.y) - 25))
+            self.screen.blit(text, text_rect)
+        
         # Draw users
         for user in self.users:
-            # Pulsing effect
+            # Draw origin
             pulse = abs(math.sin(user.pulse_phase)) * 0.3 + 0.7
             radius = int(USER_RADIUS * pulse)
-            pygame.draw.circle(self.screen, COLOR_USER, (int(user.pos.x), int(user.pos.y)), radius)
+            pygame.draw.circle(self.screen, COLOR_USER, (int(user.origin.x), int(user.origin.y)), radius)
+            
+            # Draw destination if set
+            if user.destination:
+                dest_point = user.get_destination_point()
+                pygame.draw.circle(self.screen, (0, 255, 0), 
+                                 (int(dest_point.x), int(dest_point.y)), 
+                                 USER_RADIUS, 2)
+                # Draw line from origin to destination
+                pygame.draw.line(self.screen, (200, 200, 200), 
+                               (int(user.origin.x), int(user.origin.y)),
+                               (int(dest_point.x), int(dest_point.y)), 1)
+            
             # Waiting indicator if not assigned
-            if user.assigned_scooter is None:
+            if user.assigned_scooter is None and user.state == "waiting":
                 text = self.small_font.render("?", True, COLOR_TEXT)
-                text_rect = text.get_rect(center=(int(user.pos.x), int(user.pos.y)))
+                text_rect = text.get_rect(center=(int(user.origin.x), int(user.origin.y)))
                 self.screen.blit(text, text_rect)
         
         # Draw scooters
@@ -573,7 +804,7 @@ class Simulation:
             f"Idle: {idle_percent:.1f}% ({idle_count}/{len(self.scooters)})",
             f"Avg Battery: {avg_battery:.1f}%",
             f"Active Users: {active_users}",
-            f"Click to summon user"
+            f"Click 1: origin, Click 2: destination"
         ]
         
         for stat in stats:
@@ -582,52 +813,147 @@ class Simulation:
             y_offset += 20
     
     def draw_first_person_view(self):
-        """Draw first-person view from scooter perspective"""
+        """Draw realistic first-person road perspective view"""
         if not self.scooters or self.fp_scooter_index >= len(self.scooters):
             self.view_mode = "aerial"
             return
         
         scooter = self.scooters[self.fp_scooter_index]
         
-        # Background (sky)
-        self.screen.fill((135, 206, 235))
+        # Sky gradient
+        horizon_y = int(WINDOW_HEIGHT * 0.6)
+        for y in range(horizon_y):
+            ratio = y / horizon_y
+            color = (
+                int(135 + (200 - 135) * ratio),  # R
+                int(206 + (220 - 206) * ratio),  # G
+                int(235 + (255 - 235) * ratio)   # B
+            )
+            pygame.draw.line(self.screen, color, (0, y), (WINDOW_WIDTH, y))
         
-        # Draw fake 3D ground
+        # Road surface (below horizon)
+        road_color = (100, 100, 100)
+        pygame.draw.rect(self.screen, road_color, 
+                        (0, horizon_y, WINDOW_WIDTH, WINDOW_HEIGHT - horizon_y))
+        
+        # Road perspective grid (converging lines)
         center_x = WINDOW_WIDTH // 2
-        center_y = WINDOW_HEIGHT // 2
+        vanishing_point_y = horizon_y
         
-        # Ground color
-        pygame.draw.rect(self.screen, (200, 200, 200), 
-                        (0, center_y, WINDOW_WIDTH, WINDOW_HEIGHT - center_y))
+        # Center line
+        for i in range(20):
+            y = horizon_y + i * 15
+            if y >= WINDOW_HEIGHT:
+                break
+            # Calculate width based on perspective
+            depth = (y - horizon_y) / (WINDOW_HEIGHT - horizon_y)
+            road_width = WINDOW_WIDTH * (0.3 + depth * 0.7)
+            x_offset = (WINDOW_WIDTH - road_width) / 2
+            
+            # Center line
+            if i % 2 == 0:
+                line_x = center_x
+                pygame.draw.line(self.screen, (255, 255, 0), 
+                               (int(line_x - 2), int(y)), 
+                               (int(line_x + 2), int(y)), 2)
+            
+            # Road edges
+            pygame.draw.line(self.screen, (255, 255, 255),
+                           (int(x_offset), int(y)),
+                           (int(x_offset + 5), int(y)), 2)
+            pygame.draw.line(self.screen, (255, 255, 255),
+                           (int(WINDOW_WIDTH - x_offset), int(y)),
+                           (int(WINDOW_WIDTH - x_offset - 5), int(y)), 2)
         
-        # Perspective grid lines
-        for i in range(10):
-            y = center_y + i * 30
-            width = WINDOW_WIDTH * (1 - i * 0.05)
-            if width > 0:
-                x = (WINDOW_WIDTH - width) // 2
-                pygame.draw.line(self.screen, (150, 150, 150), 
-                               (x, y), (x + width, y), 1)
+        # Side lines (converging to vanishing point)
+        for side in [-1, 1]:
+            for i in range(10):
+                y = horizon_y + i * 40
+                if y >= WINDOW_HEIGHT:
+                    break
+                depth = (y - horizon_y) / (WINDOW_HEIGHT - horizon_y)
+                road_width = WINDOW_WIDTH * (0.3 + depth * 0.7)
+                x = center_x + side * road_width / 2
+                pygame.draw.circle(self.screen, (200, 200, 200), 
+                                 (int(x), int(y)), 3)
         
-        # Draw obstacles in perspective
-        for obstacle in self.obstacles:
+        # Helper function to project 3D point to screen
+        def project_to_screen(world_x, world_y, world_z=0):
+            """Project 3D world coordinates to 2D screen with perspective"""
             # Calculate relative position
-            dx = obstacle.rect.centerx - scooter.pos.x
-            dy = obstacle.rect.centery - scooter.pos.y
+            dx = world_x - scooter.pos.x
+            dy = world_y - scooter.pos.y
             
             # Rotate to scooter's perspective
-            angle_to_obstacle = math.atan2(dy, dx) - scooter.angle
+            angle_to_obj = math.atan2(dy, dx) - scooter.angle
             distance = math.sqrt(dx * dx + dy * dy)
             
-            if distance < 300 and abs(angle_to_obstacle) < math.pi / 2:
-                # Project to screen
-                screen_x = center_x + math.sin(angle_to_obstacle) * 200
-                screen_y = center_y - distance * 0.3
-                size = max(10, 100 - distance * 0.2)
-                
-                if screen_y < center_y:
-                    pygame.draw.rect(self.screen, COLOR_OBSTACLE,
-                                   (screen_x - size // 2, screen_y - size, size, size))
+            # Field of view limits (90 degrees)
+            if abs(angle_to_obj) > math.pi / 2:
+                return None, None, None, None
+            
+            # Perspective projection
+            fov = math.pi / 2  # 90 degrees
+            screen_x = center_x + math.sin(angle_to_obj) * (WINDOW_WIDTH / 2) / math.tan(fov / 2)
+            
+            # Depth affects vertical position and size
+            depth_factor = distance / 500.0  # Normalize to reasonable distance
+            screen_y = horizon_y - (1.0 / (1.0 + depth_factor)) * (WINDOW_HEIGHT - horizon_y)
+            size = max(5, 150 / (1.0 + depth_factor))
+            
+            return int(screen_x), int(screen_y), int(size), distance
+        
+        # Draw obstacles in 3D perspective
+        obstacle_data = []
+        for obstacle in self.obstacles:
+            screen_x, screen_y, size, dist = project_to_screen(obstacle.rect.centerx, obstacle.rect.centery, 30)
+            if screen_x is not None and dist < 400 and screen_y < WINDOW_HEIGHT:
+                obstacle_data.append((screen_x, screen_y, size, dist, COLOR_OBSTACLE))
+        
+        # Draw other scooters in 3D
+        for other_scooter in self.scooters:
+            if other_scooter is scooter or other_scooter.state == ScooterState.DEAD:
+                continue
+            screen_x, screen_y, size, dist = project_to_screen(other_scooter.pos.x, other_scooter.pos.y, 15)
+            if screen_x is not None and dist < 400 and screen_y < WINDOW_HEIGHT:
+                color = other_scooter.get_color()
+                obstacle_data.append((screen_x, screen_y, size, dist, color))
+        
+        # Draw landmarks in 3D
+        for landmark in self.landmarks:
+            screen_x, screen_y, size, dist = project_to_screen(landmark.pos.x, landmark.pos.y, 40)
+            if screen_x is not None and dist < 500 and screen_y < WINDOW_HEIGHT:
+                obstacle_data.append((screen_x, screen_y, size, dist, landmark.color))
+        
+        # Sort by distance (draw far objects first)
+        obstacle_data.sort(key=lambda x: x[3], reverse=True)
+        
+        # Draw all 3D objects
+        for screen_x, screen_y, size, dist, color in obstacle_data:
+            if screen_y >= horizon_y and screen_y < WINDOW_HEIGHT:
+                # Draw as 3D box
+                height = size
+                width = size * 0.6
+                # Base rectangle
+                pygame.draw.rect(self.screen, color,
+                               (screen_x - width // 2, screen_y - height, width, height))
+                # Top (perspective)
+                top_color = tuple(min(255, c + 30) for c in color)
+                pygame.draw.polygon(self.screen, top_color, [
+                    (screen_x - width // 2, screen_y - height),
+                    (screen_x - width // 4, screen_y - height - size * 0.3),
+                    (screen_x + width // 4, screen_y - height - size * 0.3),
+                    (screen_x + width // 2, screen_y - height)
+                ])
+        
+        # Speed lines (motion blur effect)
+        if scooter.velocity > 1.0:
+            for i in range(5):
+                y = horizon_y + random.randint(0, WINDOW_HEIGHT - horizon_y)
+                x_offset = random.randint(-50, 50)
+                pygame.draw.line(self.screen, (150, 150, 150, 100),
+                               (center_x + x_offset, y),
+                               (center_x + x_offset + random.randint(-20, 20), y + 10), 1)
         
         # Draw target direction arrow if scooter has a target
         if scooter.target:
@@ -641,25 +967,27 @@ class Simulation:
             while target_angle < -math.pi:
                 target_angle += 2 * math.pi
             
-            # Draw arrow on screen (centered, pointing to target)
-            arrow_x = center_x + math.sin(target_angle) * 150
-            arrow_y = center_y - 50
-            
-            # Draw arrow line
-            pygame.draw.line(self.screen, (255, 255, 0), 
-                           (center_x, center_y - 20), (int(arrow_x), int(arrow_y)), 3)
-            # Draw arrowhead
-            arrow_size = 10
-            arrow_angle1 = target_angle + math.pi - 0.5
-            arrow_angle2 = target_angle + math.pi + 0.5
-            pygame.draw.line(self.screen, (255, 255, 0),
-                           (int(arrow_x), int(arrow_y)),
-                           (int(arrow_x + math.cos(arrow_angle1) * arrow_size),
-                            int(arrow_y + math.sin(arrow_angle1) * arrow_size)), 3)
-            pygame.draw.line(self.screen, (255, 255, 0),
-                           (int(arrow_x), int(arrow_y)),
-                           (int(arrow_x + math.cos(arrow_angle2) * arrow_size),
-                            int(arrow_y + math.sin(arrow_angle2) * arrow_size)), 3)
+            # Only show arrow if target is in front
+            if abs(target_angle) < math.pi / 2:
+                # Draw arrow on screen (centered, pointing to target)
+                arrow_x = center_x + math.sin(target_angle) * 150
+                arrow_y = horizon_y - 50
+                
+                # Draw arrow line
+                pygame.draw.line(self.screen, (255, 255, 0), 
+                               (center_x, horizon_y - 20), (int(arrow_x), int(arrow_y)), 3)
+                # Draw arrowhead
+                arrow_size = 10
+                arrow_angle1 = target_angle + math.pi - 0.5
+                arrow_angle2 = target_angle + math.pi + 0.5
+                pygame.draw.line(self.screen, (255, 255, 0),
+                               (int(arrow_x), int(arrow_y)),
+                               (int(arrow_x + math.cos(arrow_angle1) * arrow_size),
+                                int(arrow_y + math.sin(arrow_angle1) * arrow_size)), 3)
+                pygame.draw.line(self.screen, (255, 255, 0),
+                               (int(arrow_x), int(arrow_y)),
+                               (int(arrow_x + math.cos(arrow_angle2) * arrow_size),
+                                int(arrow_y + math.sin(arrow_angle2) * arrow_size)), 3)
         
         # Draw HUD overlay
         hud_rect = pygame.Rect(10, 10, 200, 120)
