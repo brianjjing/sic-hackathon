@@ -925,7 +925,7 @@ class Simulation:
         # If no scooter available, user will wait (shown in queue)
     
     def _spawn_pedestrian_user(self, use_our_scooters=True):
-        """Spawn a new pedestrian/user at random location"""
+        """Spawn a new pedestrian/user at random location - OUR SCOOTERS GET PRIORITY"""
         # Random origin
         origin_x = random.randint(50, WINDOW_WIDTH - 50)
         origin_y = random.randint(50, WINDOW_HEIGHT - 50)
@@ -941,22 +941,23 @@ class Simulation:
         user = User(origin_x, origin_y, destination)
         self.users.append(user)
         
-        if use_our_scooters:
-            # Force assign to our scooter (if available)
-            min_dist = float('inf')
-            closest_scooter = None
-            for scooter in self.scooters:
-                if scooter.state == ScooterState.IDLE and scooter.battery > 0:
-                    dist = scooter.distance_to(user.origin)
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_scooter = scooter
-            if closest_scooter:
-                closest_scooter.assign_user(user)
-                self.ride_start_times[id(user)] = pygame.time.get_ticks()
-                self.our_active_users += 1
-        else:
-            # Force assign to SPIN
+        # ALWAYS try our scooters first, regardless of use_our_scooters flag
+        min_dist = float('inf')
+        closest_scooter = None
+        for scooter in self.scooters:
+            if scooter.state == ScooterState.IDLE and scooter.battery > 0:
+                dist = scooter.distance_to(user.origin)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_scooter = scooter
+        
+        if closest_scooter:
+            # Our scooter available - assign to it (PRIORITY!)
+            closest_scooter.assign_user(user)
+            self.ride_start_times[id(user)] = pygame.time.get_ticks()
+            self.our_active_users += 1
+        elif not use_our_scooters:
+            # No our scooters available AND we're trying to fill SPIN quota - assign to SPIN
             min_dist = float('inf')
             closest_spin = None
             for spin_scooter in self.spin_scooters:
@@ -971,9 +972,10 @@ class Simulation:
                 self.pedestrians.append(pedestrian)
                 self.ride_start_times[id(user)] = pygame.time.get_ticks()
                 self.spin_active_users += 1
+        # If use_our_scooters=True but none available, user will wait and be assigned later
     
     def _maintain_pedestrian_count(self):
-        """Maintain target pedestrian counts (3 our, 3 SPIN) - spawn max 1 per second"""
+        """Maintain target pedestrian counts (3 our, 3 SPIN) - spawn max 1 per second, OUR SCOOTERS GET PRIORITY"""
         # Rate limiting: only spawn one pedestrian per second
         self.pedestrian_spawn_timer += 1
         if self.pedestrian_spawn_timer < PEDESTRIAN_SPAWN_INTERVAL:
@@ -997,19 +999,20 @@ class Simulation:
                                     if p.state in ["walking_to_scooter", "riding"])
         spin_count = spin_user_count + spin_pedestrian_count
         
-        # Spawn ONE pedestrian per second (prioritize whichever is lower)
-        if our_count < TARGET_PEDESTRIANS_OUR and spin_count < TARGET_PEDESTRIANS_SPIN:
-            # Both need more - spawn the one that's further below target
-            our_deficit = TARGET_PEDESTRIANS_OUR - our_count
-            spin_deficit = TARGET_PEDESTRIANS_SPIN - spin_count
-            if our_deficit >= spin_deficit:
-                self._spawn_pedestrian_user(use_our_scooters=True)
-            else:
-                self._spawn_pedestrian_user(use_our_scooters=False)
-        elif our_count < TARGET_PEDESTRIANS_OUR:
+        # Check if we have available our scooters
+        available_our_scooters = sum(1 for s in self.scooters 
+                                    if s.state == ScooterState.IDLE and s.battery > 0)
+        
+        # ALWAYS prioritize our scooters - only use SPIN if no our scooters available
+        if our_count < TARGET_PEDESTRIANS_OUR and available_our_scooters > 0:
+            # Spawn for our scooters (they have priority!)
             self._spawn_pedestrian_user(use_our_scooters=True)
-        elif spin_count < TARGET_PEDESTRIANS_SPIN:
+        elif spin_count < TARGET_PEDESTRIANS_SPIN and available_our_scooters == 0:
+            # Only use SPIN if NO our scooters are available
             self._spawn_pedestrian_user(use_our_scooters=False)
+        elif our_count < TARGET_PEDESTRIANS_OUR:
+            # Still need more for our scooters, try to spawn (will wait if none available)
+            self._spawn_pedestrian_user(use_our_scooters=True)
     
     def update(self):
         """Update all game objects"""
